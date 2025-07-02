@@ -1,0 +1,12 @@
+discord
+googletrans
+pyshorteners
+yt_dlp
+pytz
+playwright
+spotipy
+ffmpeg
+flask
+dotenv
+ffmpeg
+ngrok
