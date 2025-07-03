@@ -10,3 +10,5 @@ flask
 dotenv
 ffmpeg
 ngrok
+fastapi
+uvicorn
