@@ -1,13 +1,12 @@
 import os, time, glob, shutil, spotipy, requests, threading, subprocess, zipfile, signal, asyncio
 from Gears.Ids import CMusic
-from flask import Flask, send_file, make_response, request
+from flask import Flask, send_file, make_response, request, send_from_directory
 from spotipy.oauth2 import SpotifyOAuth
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from yt_dlp import YoutubeDL
 from urllib.parse import quote
 from bot_Function import Client_secret, Refresh_token
 
-IS_RENDER = os.getenv("RENDER") == "true"
 BASE_DIR = os.path.abspath(os.path.dirname(__file__)) if '__file__' in globals() else os.getcwd()
 path_downloads = os.path.join(BASE_DIR, 'Downloads_playlists/')
 
@@ -22,6 +21,19 @@ auth_manager = SpotifyOAuth(client_id=CLIENT_ID, client_secret=CLIENT_SECRET, re
 token_info = auth_manager.refresh_access_token(REFRESH_TOKEN)
 access_token = token_info['access_token']
 sp = spotipy.Spotify(auth=access_token)
+
+
+app = Flask(__name__)
+DOWNLOAD_FOLDER = path_downloads
+
+
+@app.route('/Functions/Music/Downloads_playlists/<path:filename>')
+def download_file(filename):
+    return send_from_directory(DOWNLOAD_FOLDER, filename, as_attachment=True)
+
+
+def start_flask():
+    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=8080)).start()
 
 
 def normalize_str(string):
@@ -44,7 +56,6 @@ def download_from_youtube(track, playlist_name):
         'extract_flat': True,
         'force_generic_extractor': True,
     }
-
     with YoutubeDL(ydl_opts) as ydl:
         try:
             search_results = ydl.extract_info(f"ytsearch3:{track_name} {artist_name}", download=False).get('entries', [])
@@ -95,7 +106,10 @@ def normalize_audio(input_file):
     print("Audio normalizado correctamente.")
 
 
-def get_playlist(playlist_url):
+async def get_playlist(playlist_url):
+    loop = asyncio.get_running_loop()
+
+    # Obtener playlist de Spotify
     playlist_id = playlist_url.split("/")[-1].split("?")[0]
     playlist = sp.playlist(playlist_id)
     playlist_name = normalize_str(playlist['name']).strip()
@@ -105,66 +119,52 @@ def get_playlist(playlist_url):
     while results['next']:
         results = sp.next(results)
         all_tracks.extend(results['items'])
+    
+    # Asegurar carpeta
+    os.makedirs(f"{path_downloads}/{playlist_name}", exist_ok=True)
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        for item in all_tracks:
-            executor.submit(download_from_youtube, item['track'], playlist_name)
+    # Función bloqueante
+    def blocking_download_and_zip():
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [
+                executor.submit(download_from_youtube, item['track'], playlist_name)
+                for item in all_tracks
+            ]
+            # Esperar a que terminen todos
+            for future in as_completed(futures):
+                future.result()
 
-    zip_path = f'{path_downloads}/{playlist_name}.zip'
-    with zipfile.ZipFile(zip_path, 'w') as zipf:
-        for root, dirs, files in os.walk(f'{path_downloads}/{playlist_name}'):
-            for file in files:
-                zipf.write(os.path.join(root, file), file)
+        # Crear zip
+        zip_path = f'{path_downloads}/{playlist_name}.zip'
+        with zipfile.ZipFile(zip_path, 'w') as zipf:
+            for root, dirs, files in os.walk(f'{path_downloads}/{playlist_name}'):
+                for file in files:
+                    zipf.write(os.path.join(root, file), file)
 
-    shutil.rmtree(f"{path_downloads}/{playlist_name}")
+        # Limpiar carpeta
+        shutil.rmtree(f"{path_downloads}/{playlist_name}")
+
+        return zip_path
+
+    # Ejecutar en thread pool
+    zip_path = await loop.run_in_executor(None, blocking_download_and_zip)
     return zip_path
 
 
-async def upload_file(file_path, ctx):
-    app = Flask(__name__)
-    port = 7987
+async def upload_file(zip_file, ctx):
+    DOMAIN = os.environ.get("DOMAIN_URL", "http://localhost:8080")
+    file_name = os.path.basename(zip_file)
+    public_url = f"{DOMAIN}/Functions/Music/Downloads_playlists/{file_name}"
+    print(public_url)
 
-    result = {
-        'public_url': None, 'download_event': asyncio.Event(), 'shutdown_event': asyncio.Event()
-    }
-
-    @app.route('/download')
-    def download_file():
-        response = make_response(send_file(file_path, as_attachment=True))
-        response.headers["ngrok-skip-browser-warning"] = "true"
-        return response
-
-    def run_server():
-        app.run(port=port, host="0.0.0.0")
-
-    async def start_ngrok():
-        if IS_RENDER:
-            result['public_url'] = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:5000")
-        else:
-            ngrok_process = subprocess.Popen(["ngrok", "http", str(port)],
-                                             stdout=subprocess.PIPE,
-                                             stderr=subprocess.PIPE)
-            await asyncio.sleep(2)
-            try:
-                tunnels = requests.get("http://localhost:4040/api/tunnels").json()
-                result['public_url'] = tunnels["tunnels"][0]["public_url"]
-            except Exception as e:
-                print("ngrok error:", e)
-                return
-
-        print(f"🔗 URL: {result['public_url']}/download")
-        await ctx.edit_original_response(content=f"Descarga lista: {result['public_url']}/download")
-        await asyncio.wait_for(result['shutdown_event'].wait(), timeout=7200)
-
-    flask_thread = threading.Thread(target=run_server, daemon=True)
-    flask_thread.start()
-
-    await start_ngrok()
-    os.remove(file_path)
+    #await ctx.response.send_message(f"✅ Playlist descargada. Puedes bajarla aquí:\n{public_url}")
     return
 
 
 async def set_up(ctx, url, bot):
     await ctx.response.send_message('Descargando...')
-    zip_file = get_playlist(url)
+    zip_file = await get_playlist(url)
     await upload_file(zip_file, ctx)
+
+
+start_flask()
